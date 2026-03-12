@@ -1,0 +1,324 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: recruiter-postgres
+    environment:
+      POSTGRES_USER: recruiter
+      POSTGRES_PASSWORD: recruiter
+      POSTGRES_DB: recruiter
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recruiter"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: apache/kafka:latest
+    container_name: recruiter-kafka
+    environment:
+      KAFKA_NODE_ID: 0
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      # Increase message size limits
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
+      KAFKA_FETCH_MESSAGE_MAX_BYTES: 10485760
+      # Enable auto topic creation
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    healthcheck:
+      test: 
+        - "CMD-SHELL"
+        - "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 && kafka-topics.sh --bootstrap-server localhost:9092 --list"
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: recruiter-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8085:8080"
+
+  db-core:
+    build:
+      context: ./db-core
+    container_name: recruiter-db-core
+    environment:
+      DATABASE_URL: postgresql+asyncpg://recruiter:recruiter@postgres:5432/recruiter
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  bot-core:
+    build:
+      context: ./bot-core
+    container_name: recruiter-bot-core
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      COMMANDS_TOPIC: bot.commands
+      STATUS_TOPIC: bot.status
+      BOT_EVENTS_TOPIC: bot.events
+      OFFER_EVENTS_TOPIC: offer.events
+      BOT_RESPONSES_TOPIC: bot.responses
+      DB_CORE_URL: http://db-core:8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      kafka:
+        condition: service_started  # Изменено с service_healthy на service_started, так как Kafka работает, но healthcheck может быть нестабильным
+      db-core:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  hr-bot:
+    build:
+      context: ./hr-bot
+    container_name: recruiter-hr-bot
+    profiles: ["workers"]
+    environment:
+      DB_CORE_URL: http://db-core:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      BOT_EVENTS_TOPIC: bot.events
+      OFFER_EVENTS_TOPIC: offer.events
+      BOT_RESPONSES_TOPIC: bot.responses
+      MANAGER_PANEL_URL: http://manager-panel:8000
+    depends_on:
+      kafka:
+        condition: service_healthy
+      db-core:
+        condition: service_healthy
+      manager-panel:
+        condition: service_healthy
+    command: ["python", "main.py"]
+
+  offer-analyzer:
+    build:
+      context: ./OfferAnalyzer
+    container_name: recruiter-offer-analyzer
+    environment:
+      DB_CORE_URL: http://db-core:8000
+      PAYMENT_GATEWAY_URL: http://payment-gateway:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OFFER_EVENTS_TOPIC: offer.events
+      BOT_RESPONSES_TOPIC: bot.responses
+    profiles: ["workers"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      db-core:
+        condition: service_healthy
+    command: ["python", "main.py"]
+
+  core-bot:
+    build:
+      context: ./core-bot
+    container_name: recruiter-core-bot
+    environment:
+      CORE_BOT_TOKEN: ${CORE_BOT_TOKEN:-}
+      DB_CORE_URL: http://db-core:8000
+      PAYMENT_GATEWAY_URL: http://payment-gateway:8000
+      PAYMENT_PROVIDER_TOKEN: ${PAYMENT_PROVIDER_TOKEN:-}
+      IS_TEST: ${IS_TEST:-true}
+      ADMIN_CHAT_IDS: ${ADMIN_CHAT_IDS:-}
+      DADATA_API_KEY: ${DADATA_API_KEY:-}
+    depends_on:
+      db-core:
+        condition: service_healthy
+      payment-gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  payment-gateway:
+    build:
+      context: ./payment-gateway
+    container_name: recruiter-payment-gateway
+    environment:
+      DATABASE_URL: postgresql+asyncpg://recruiter:recruiter@postgres:5432/recruiter
+      DB_CORE_URL: http://db-core:8000
+      ROBOKASSA_MERCHANT_LOGIN: ${ROBOKASSA_MERCHANT_LOGIN:-}
+      ROBOKASSA_PASSWORD1: ${ROBOKASSA_PASSWORD1:-}
+      ROBOKASSA_PASSWORD2: ${ROBOKASSA_PASSWORD2:-}
+      ROBOKASSA_IS_TEST: ${ROBOKASSA_IS_TEST:-true}
+      MY_TAX_INN: ${MY_TAX_INN:-}
+      MY_TAX_API_KEY: ${MY_TAX_API_KEY:-}
+      SELFWORK_STANDARD_URL: ${SELFWORK_STANDARD_URL:-}
+      SELFWORK_BUSINESS_URL: ${SELFWORK_BUSINESS_URL:-}
+      SELFWORK_PROFESSIONAL_URL: ${SELFWORK_PROFESSIONAL_URL:-}
+      SELFWORK_WEBHOOK_SECRET: ${SELFWORK_WEBHOOK_SECRET:-}
+      SELFWORK_API_KEY: ${SELFWORK_API_KEY:-}
+      SELFWORK_API_BASE_URL: ${SELFWORK_API_BASE_URL:-}
+      SELFWORK_MERCHANT_DOMAIN: ${SELFWORK_MERCHANT_DOMAIN:-}
+      IS_TEST: ${IS_TEST:-false}
+    ports:
+      - "8002:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-core:
+        condition: service_healthy
+    healthcheck:
+      test: 
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  admin-panel:
+    build:
+      context: ./admin-panel
+    container_name: recruiter-admin-panel
+    environment:
+      DB_CORE_URL: http://db-core:8000
+      BOT_CORE_URL: http://bot-core:8000
+      PAYMENT_GATEWAY_URL: http://payment-gateway:8000
+      DATABASE_URL: postgresql+asyncpg://recruiter:recruiter@postgres:5432/recruiter
+      SECRET_KEY: ${ADMIN_SECRET_KEY:-your-secret-key-change-in-production}
+      CORS_ORIGINS: '["http://localhost:3000", "http://localhost:5173", "http://localhost:80"]'
+    ports:
+      - "8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-core:
+        condition: service_healthy
+      bot-core:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  admin-panel-frontend:
+    build:
+      context: ./admin-panel/frontend
+    container_name: recruiter-admin-panel-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - admin-panel
+    restart: unless-stopped
+
+  video-conference:
+    build:
+      context: ./video-conference
+    container_name: recruiter-video-conference
+    environment:
+      TRANSCRIPTS_DIR: /app/transcripts
+      CORS_ORIGINS: '["http://localhost:3001", "http://localhost:5173", "http://localhost:80"]'
+      DB_CORE_URL: http://db-core:8000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      BOT_RESPONSES_TOPIC: bot.responses
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    ports:
+      - "8004:8000"
+    volumes:
+      - video_transcripts:/app/transcripts
+    depends_on:
+      - db-core
+      - kafka
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  video-conference-frontend:
+    build:
+      context: ./video-conference/frontend
+    container_name: recruiter-video-conference-frontend
+    ports:
+      - "3001:80"
+    depends_on:
+      - video-conference
+    restart: unless-stopped
+
+  manager-panel:
+    build:
+      context: ./manager-panel
+    container_name: recruiter-manager-panel
+    environment:
+      DATABASE_URL: postgresql+asyncpg://recruiter:recruiter@postgres:5432/recruiter
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      DB_CORE_URL: http://db-core:8000
+      CORS_ORIGINS_STR: http://localhost:3002,http://localhost:80
+    ports:
+      - "8005:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-core:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  manager-panel-frontend:
+    build:
+      context: ./manager-panel/frontend
+    container_name: recruiter-manager-panel-frontend
+    environment:
+      VITE_API_URL: http://localhost:8005/api
+    ports:
+      - "3002:80"
+    depends_on:
+      - manager-panel
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  video_transcripts:
+
